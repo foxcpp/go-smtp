@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/emersion/go-sasl"
 	"github.com/emersion/go-smtp"
@@ -572,6 +574,39 @@ func TestServerEmptyTo(t *testing.T) {
 	}
 }
 
+func TestServerPostmasterWithoutDomain(t *testing.T) {
+	be, s, c, scanner := testServerAuthenticated(t)
+	defer s.Close()
+	defer c.Close()
+
+	io.WriteString(c, "MAIL FROM:<root@nsa.gov>\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("Invalid MAIL response:", scanner.Text())
+	}
+
+	io.WriteString(c, "RCPT TO:<Postmaster>\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("Invalid RCPT response:", scanner.Text())
+	}
+
+	io.WriteString(c, "DATA\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "354 ") {
+		t.Fatal("Invalid DATA response:", scanner.Text())
+	}
+	io.WriteString(c, "From: root@nsa.gov\r\n\r\nHey\r\n.\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("Invalid DATA response:", scanner.Text())
+	}
+
+	if len(be.messages) != 1 || len(be.messages[0].To) != 1 || be.messages[0].To[0] != "Postmaster" {
+		t.Fatal("Invalid mail recipients:", be.messages)
+	}
+}
+
 func TestServer(t *testing.T) {
 	be, s, c, scanner := testServerAuthenticated(t)
 	defer s.Close()
@@ -961,6 +996,54 @@ func TestServer_authParam(t *testing.T) {
 	}
 }
 
+func TestServerBdatDiscard(t *testing.T) {
+	_, s, c, scanner, _ := testServerEhlo(t)
+	defer s.Close()
+	defer c.Close()
+
+	// The chunk is command text on purpose. A client that writes BDAT and
+	// the next command in one buffer leaves those bytes in the stream. If
+	// they are not discarded, the server parses them as MAIL and the NOOP
+	// below comes back as 501.
+	io.WriteString(c, "BDAT 9 LAST\r\nMAIL FROM")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "502 ") {
+		t.Fatal("Invalid BDAT response:", scanner.Text())
+	}
+
+	io.WriteString(c, "NOOP\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("Invalid NOOP response:", scanner.Text())
+	}
+}
+
+func TestServerBdatNoRecipientsDiscard(t *testing.T) {
+	_, s, c, scanner, _ := testServerEhlo(t)
+	defer s.Close()
+	defer c.Close()
+
+	// Same shape as TestServerBdatDiscard. The chunk text is a command so a
+	// missed discard shows up as a 501 on the NOOP, not as a clean 250.
+	io.WriteString(c, "MAIL FROM:<alice@wonderland.book>\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("Invalid MAIL FROM response:", scanner.Text())
+	}
+
+	io.WriteString(c, "BDAT 7 LAST\r\nRCPT TO")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "502 ") {
+		t.Fatal("Invalid BDAT response:", scanner.Text())
+	}
+
+	io.WriteString(c, "NOOP\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("Invalid NOOP response:", scanner.Text())
+	}
+}
+
 func TestServer_Chunking(t *testing.T) {
 	be, s, c, scanner := testServerAuthenticated(t)
 	defer s.Close()
@@ -1223,6 +1306,63 @@ func TestServer_Chunking_tooLongMessage(t *testing.T) {
 
 	if len(be.messages) != 0 || len(be.anonmsgs) != 0 {
 		t.Fatal("Invalid number of sent messages:", be.messages, be.anonmsgs)
+	}
+}
+
+func TestServer_Chunking_lineLimitRestoredAfterReset(t *testing.T) {
+	_, s, c, scanner := testServerAuthenticated(t)
+	defer s.Close()
+	defer c.Close()
+
+	io.WriteString(c, "MAIL FROM:<root@nsa.gov>\r\n")
+	scanner.Scan()
+	io.WriteString(c, "RCPT TO:<root@gchq.gov.uk>\r\n")
+	scanner.Scan()
+
+	io.WriteString(c, "BDAT 8\r\n")
+	io.WriteString(c, "Hey <3\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("Invalid BDAT response:", scanner.Text())
+	}
+
+	// The client gives up on the message instead of sending the last chunk.
+	io.WriteString(c, "RSET\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("Invalid RSET response:", scanner.Text())
+	}
+
+	// The transfer is over, so MaxLineLength should be enforced again.
+	io.WriteString(c, "NOOP "+strings.Repeat("x", s.MaxLineLength)+"\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "500 ") {
+		t.Fatal("Invalid response to an over-long line:", scanner.Text())
+	}
+}
+
+func TestServer_Chunking_lineLimitInsideTransaction(t *testing.T) {
+	_, s, c, scanner := testServerAuthenticated(t)
+	defer s.Close()
+	defer c.Close()
+
+	io.WriteString(c, "MAIL FROM:<root@nsa.gov>\r\n")
+	scanner.Scan()
+	io.WriteString(c, "RCPT TO:<root@gchq.gov.uk>\r\n")
+	scanner.Scan()
+
+	io.WriteString(c, "BDAT 8\r\n")
+	io.WriteString(c, "Hey <3\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("Invalid BDAT response:", scanner.Text())
+	}
+
+	// MaxLineLength should be enforced inside a BDAT transaction
+	io.WriteString(c, "NOOP "+strings.Repeat("x", s.MaxLineLength)+"\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "500 ") {
+		t.Fatal("Invalid response to an over-long line:", scanner.Text())
 	}
 }
 
@@ -1512,5 +1652,253 @@ func TestServerDSNwithSMTPUTF8(t *testing.T) {
 	}
 	if val := opts[2].OriginalRecipient; val != dsnEmailUTF8 {
 		t.Fatal("Invalid ORCPT address:", val)
+	}
+}
+
+func TestServerRRVS(t *testing.T) {
+	be, s, c, scanner, caps := testServerEhlo(t,
+		func(s *smtp.Server) {
+			s.EnableRRVS = true
+		})
+	defer s.Close()
+	defer c.Close()
+
+	if _, ok := caps["RRVS"]; !ok {
+		t.Fatal("Missing capability: RRVS")
+	}
+
+	io.WriteString(c, "MAIL FROM:<root@nsa.gov>\r\n")
+	scanner.Scan()
+
+	io.WriteString(c, "RCPT TO:<root@gchq.gov.uk> RRVS=\r\n")
+	scanner.Scan()
+
+	if !strings.HasPrefix(scanner.Text(), "501 5.5.4") {
+		t.Fatal("Unexpected res on malformed RRVS parameter value:", scanner.Text())
+	}
+
+	io.WriteString(c, "RCPT TO:<root@gchq.gov.uk> RRVS=1234\r\n")
+	scanner.Scan()
+
+	if !strings.HasPrefix(scanner.Text(), "501 5.5.4 ") {
+		t.Fatal("Unexpected res on malformed RRVS parameter value:", scanner.Text())
+	}
+
+	io.WriteString(c, "RCPT TO:<root@gchq.gov.uk> RRVS=2014-04-03T23:01:00Z\r\n")
+	scanner.Scan()
+
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("Invalid RRVS parameter value:", scanner.Text())
+	}
+
+	io.WriteString(c, "RCPT TO:<root@bnd.bund.de> RRVS=2020-03-19T11:13:00Z;ign0r3.th1s;othr_stuff\r\n")
+	scanner.Scan()
+
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("Invalid RRVS parameter value:", scanner.Text())
+	}
+
+	// complete the transaction
+	io.WriteString(c, "DATA\r\n")
+	scanner.Scan()
+	io.WriteString(c, "Hey <3\r\n")
+	io.WriteString(c, ".\r\n")
+	scanner.Scan()
+
+	opts := be.anonmsgs[0].RcptOpts
+	if opts == nil || len(opts) != 2 {
+		t.Fatal("Invalid number of recipients:", opts)
+	}
+
+	if !opts[0].RequireRecipientValidSince.Equal(time.Date(2014, time.April, 3, 23, 1, 0, 0, time.UTC)) {
+		t.Fatal("Invalid RRVS parameter value:", fmt.Sprintf("%#v", opts[0].RequireRecipientValidSince))
+	}
+
+	if !opts[1].RequireRecipientValidSince.Equal(time.Date(2020, time.March, 19, 11, 13, 0, 0, time.UTC)) {
+		t.Fatal("Invalid RRVS parameter value:", fmt.Sprintf("%#v", opts[1].RequireRecipientValidSince))
+	}
+}
+
+// readReply returns the next reply line, failing the test rather than
+// silently yielding "" if the connection dropped.
+func readReply(t *testing.T, scanner *bufio.Scanner) string {
+	t.Helper()
+	if !scanner.Scan() {
+		if err := scanner.Err(); err != nil {
+			t.Fatal("Reading reply failed:", err)
+		}
+		t.Fatal("Connection closed while waiting for a reply")
+	}
+	return scanner.Text()
+}
+
+func TestServerDELIVERBY(t *testing.T) {
+	be, s, c, scanner, caps := testServerEhlo(t,
+		func(s *smtp.Server) {
+			s.EnableDELIVERBY = true
+			s.MinimumDeliverByTime = 50 * time.Second
+		})
+	defer s.Close()
+	defer c.Close()
+
+	if !caps["DELIVERBY 50"] {
+		t.Fatal("Missing capability: DELIVERBY 50")
+	}
+
+	// RFC 2852 section 4 puts BY on MAIL FROM, so a bad value must be
+	// rejected before a transaction is opened.
+	// Syntax errors get 501 5.5.4 (RFC 2852 section 4).
+	malformed := []string{
+		"BY=",        // no value
+		"BY=1234",    // no by-mode
+		"BY=123;RT;", // trailing separator
+		"BY=0;R",     // zero by-time is a syntax error with mode R
+		"BY=-1;R",    // so is a negative one
+	}
+	for _, param := range malformed {
+		_, _ = io.WriteString(c, "MAIL FROM:<root@nsa.gov> "+param+"\r\n")
+		if res := readReply(t, scanner); !strings.HasPrefix(res, "501 5.5.4") {
+			t.Errorf("MAIL FROM with %q: want 501 5.5.4, got %q", param, res)
+		}
+	}
+
+	// A syntactically valid by-time below the server minimum is a different
+	// failure: RFC 2852 section 3 requires a 55z reply, section 4 names 555
+	// for a permanent server-specific refusal.
+	_, _ = io.WriteString(c, "MAIL FROM:<root@nsa.gov> BY=100;RT\r\n")
+	if res := readReply(t, scanner); !strings.HasPrefix(res, "250 ") {
+		t.Errorf("MAIL FROM with BY=100;RT: want 250, got %q", res)
+	}
+	_, _ = io.WriteString(c, "RSET\r\n")
+	if res := readReply(t, scanner); !strings.HasPrefix(res, "250 ") {
+		t.Fatal("RSET rejected:", res)
+	}
+
+	// Values the RFC requires the server to accept: exactly at the minimum
+	// with mode R, and zero or negative with mode N (section 4).
+	accepted := []string{"BY=50;R", "BY=0;N", "BY=-1;N"}
+	for _, param := range accepted {
+		_, _ = io.WriteString(c, "MAIL FROM:<root@nsa.gov> "+param+"\r\n")
+		if res := readReply(t, scanner); !strings.HasPrefix(res, "250 ") {
+			t.Errorf("MAIL FROM with %q: want 250, got %q", param, res)
+		}
+		_, _ = io.WriteString(c, "RSET\r\n")
+		if res := readReply(t, scanner); !strings.HasPrefix(res, "250 ") {
+			t.Fatal("RSET rejected:", res)
+		}
+	}
+
+	// The parsed value reaches the backend on the completed transaction.
+	_, _ = io.WriteString(c, "MAIL FROM:<root@nsa.gov> BY=100;NT\r\n")
+	if res := readReply(t, scanner); !strings.HasPrefix(res, "250 ") {
+		t.Fatal("MAIL FROM rejected:", res)
+	}
+	_, _ = io.WriteString(c, "RCPT TO:<root@gchq.gov.uk>\r\n")
+	if res := readReply(t, scanner); !strings.HasPrefix(res, "250 ") {
+		t.Fatal("RCPT TO rejected:", res)
+	}
+	_, _ = io.WriteString(c, "DATA\r\n")
+	if res := readReply(t, scanner); !strings.HasPrefix(res, "354 ") {
+		t.Fatal("DATA rejected:", res)
+	}
+	_, _ = io.WriteString(c, "Hey <3\r\n")
+	_, _ = io.WriteString(c, ".\r\n")
+	if res := readReply(t, scanner); !strings.HasPrefix(res, "250 ") {
+		t.Fatal("Message rejected:", res)
+	}
+
+	if len(be.anonmsgs) != 1 {
+		t.Fatalf("Invalid number of sent messages: want 1, got %d", len(be.anonmsgs))
+	}
+	opts := be.anonmsgs[0].Opts
+	if opts == nil {
+		t.Fatal("MailOptions is nil")
+	}
+	if opts.DeliverBy == nil {
+		t.Fatal("DeliverBy is nil")
+	}
+
+	want := smtp.DeliverByOptions{
+		Time:  100 * time.Second,
+		Mode:  smtp.DeliverByNotify,
+		Trace: true,
+	}
+	if *opts.DeliverBy != want {
+		t.Fatalf("DeliverBy: want %#v, got %#v", want, *opts.DeliverBy)
+	}
+}
+
+func TestServerMTPRIORITY(t *testing.T) {
+	be, s, c, scanner, caps := testServerEhlo(t,
+		func(s *smtp.Server) {
+			s.EnableMTPRIORITY = true
+		})
+	defer s.Close()
+	defer c.Close()
+
+	if !caps["MT-PRIORITY"] {
+		t.Fatal("Missing capability: MT-PRIORITY")
+	}
+
+	// RFC 6710 section 3 puts MT-PRIORITY on MAIL FROM, so a bad value must
+	// be rejected before a transaction is opened.
+	malformed := []string{
+		"MT-PRIORITY=",
+		"MT-PRIORITY=foo",
+		"MT-PRIORITY=-10",
+		"MT-PRIORITY=10",
+	}
+	for _, param := range malformed {
+		_, _ = io.WriteString(c, "MAIL FROM:<root@nsa.gov> "+param+"\r\n")
+		if res := readReply(t, scanner); !strings.HasPrefix(res, "501 5.5.4") {
+			t.Errorf("MAIL FROM with %q: want 501 5.5.4, got %q", param, res)
+		}
+	}
+
+	// Range boundaries are accepted.
+	for _, priority := range []int{-9, 0, 9} {
+		_, _ = io.WriteString(c, fmt.Sprintf("MAIL FROM:<root@nsa.gov> MT-PRIORITY=%d\r\n", priority))
+		if res := readReply(t, scanner); !strings.HasPrefix(res, "250 ") {
+			t.Errorf("MAIL FROM with MT-PRIORITY=%d: want 250, got %q", priority, res)
+		}
+		_, _ = io.WriteString(c, "RSET\r\n")
+		if res := readReply(t, scanner); !strings.HasPrefix(res, "250 ") {
+			t.Fatal("RSET rejected:", res)
+		}
+	}
+
+	// The value reaches the backend on the completed transaction.
+	const expectedPriority = -2
+
+	_, _ = io.WriteString(c, fmt.Sprintf("MAIL FROM:<root@nsa.gov> MT-PRIORITY=%d\r\n", expectedPriority))
+	if res := readReply(t, scanner); !strings.HasPrefix(res, "250 ") {
+		t.Fatal("MAIL FROM rejected:", res)
+	}
+	_, _ = io.WriteString(c, "RCPT TO:<root@gchq.gov.uk>\r\n")
+	if res := readReply(t, scanner); !strings.HasPrefix(res, "250 ") {
+		t.Fatal("RCPT TO rejected:", res)
+	}
+	_, _ = io.WriteString(c, "DATA\r\n")
+	if res := readReply(t, scanner); !strings.HasPrefix(res, "354 ") {
+		t.Fatal("DATA rejected:", res)
+	}
+	_, _ = io.WriteString(c, "Hey <3\r\n")
+	_, _ = io.WriteString(c, ".\r\n")
+	if res := readReply(t, scanner); !strings.HasPrefix(res, "250 ") {
+		t.Fatal("Message rejected:", res)
+	}
+
+	if len(be.anonmsgs) != 1 {
+		t.Fatalf("Invalid number of sent messages: want 1, got %d", len(be.anonmsgs))
+	}
+	opts := be.anonmsgs[0].Opts
+	if opts == nil {
+		t.Fatal("MailOptions is nil")
+	}
+	if opts.MTPriority == nil {
+		t.Fatal("MTPriority is nil")
+	}
+	if *opts.MTPriority != expectedPriority {
+		t.Fatalf("MTPriority: want %d, got %d", expectedPriority, *opts.MTPriority)
 	}
 }

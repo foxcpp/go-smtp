@@ -58,6 +58,140 @@ func (toServerNoRespAuth) Next(fromServer []byte) (toServer []byte, err error) {
 	panic("unexpected call")
 }
 
+// A mechanism without an initial response must answer the first challenge
+// itself, not with an empty line.
+func TestClientAuthNoInitialResponse(t *testing.T) {
+	server := "334 Y2hhbGxlbmdl\r\n" +
+		"235 2.0.0 OK\r\n"
+	var wrote bytes.Buffer
+	var fake faker
+	fake.ReadWriter = struct {
+		io.Reader
+		io.Writer
+	}{
+		strings.NewReader(server),
+		&wrote,
+	}
+	c := NewClient(fake)
+	c.didHello = true
+	if err := c.Auth(challengeAuth{}); err != nil {
+		t.Fatalf("Auth: %v", err)
+	}
+	c.Close()
+	if got, want := wrote.String(), "AUTH CHALLENGE\r\ncmVzcG9uc2U=\r\n"; got != want {
+		t.Errorf("wrote %q; want %q", got, want)
+	}
+}
+
+type challengeAuth struct{}
+
+func (challengeAuth) Start() (proto string, toServer []byte, err error) {
+	return "CHALLENGE", nil, nil
+}
+
+func (challengeAuth) Next(fromServer []byte) (toServer []byte, err error) {
+	return []byte("response"), nil
+}
+
+// A SASL initial response too large to inline within the 512-octet command-line
+// limit must be deferred to the first challenge instead of being appended to the
+// AUTH command line. https://github.com/emersion/go-smtp/issues/301
+func TestClientAuthLargeInitialResponse(t *testing.T) {
+	server := "334 \r\n" +
+		"235 2.0.0 OK\r\n"
+	client := "AUTH LARGE\r\n" +
+		strings.Repeat("eHh4", 200) + "\r\n"
+	var wrote bytes.Buffer
+	var fake faker
+	fake.ReadWriter = struct {
+		io.Reader
+		io.Writer
+	}{
+		strings.NewReader(server),
+		&wrote,
+	}
+	c := NewClient(fake)
+	c.didHello = true
+	if err := c.Auth(largeInitialRespAuth{mech: "LARGE", resp: bytes.Repeat([]byte("x"), 600)}); err != nil {
+		t.Fatalf("Auth: %v", err)
+	}
+	c.Close()
+	if got := wrote.String(); got != client {
+		t.Errorf("wrote %q; want %q", got, client)
+	}
+}
+
+// A challenge in the reply to AUTH aborts the exchange instead of dropping the
+// deferred initial response.
+func TestClientAuthLargeInitialResponseChallenge(t *testing.T) {
+	server := "334 Y2hhbGxlbmdl\r\n" +
+		"501 5.7.0 Authentication aborted\r\n"
+	client := "AUTH LARGE\r\n" +
+		"*\r\n"
+	var wrote bytes.Buffer
+	var fake faker
+	fake.ReadWriter = struct {
+		io.Reader
+		io.Writer
+	}{
+		strings.NewReader(server),
+		&wrote,
+	}
+	c := NewClient(fake)
+	c.didHello = true
+	if err := c.Auth(largeInitialRespAuth{mech: "LARGE", resp: bytes.Repeat([]byte("x"), 600)}); err == nil {
+		t.Fatal("Auth succeeded; want an error")
+	}
+	c.Close()
+	if got := wrote.String(); got != client {
+		t.Errorf("wrote %q; want %q", got, client)
+	}
+}
+
+// An AUTH line of exactly 512 octets is still sent inline; one more octet defers it.
+func TestClientAuthInitialResponseLimit(t *testing.T) {
+	resp64 := strings.Repeat("eHh4", 125) // 500 octets
+	for _, tc := range []struct {
+		mech, server, client string
+	}{
+		{"ABCD", "235 2.0.0 OK\r\n", "AUTH ABCD " + resp64 + "\r\n"},
+		{"ABCDE", "334 \r\n235 2.0.0 OK\r\n", "AUTH ABCDE\r\n" + resp64 + "\r\n"},
+	} {
+		var wrote bytes.Buffer
+		var fake faker
+		fake.ReadWriter = struct {
+			io.Reader
+			io.Writer
+		}{
+			strings.NewReader(tc.server),
+			&wrote,
+		}
+		c := NewClient(fake)
+		c.didHello = true
+		if err := c.Auth(largeInitialRespAuth{mech: tc.mech, resp: bytes.Repeat([]byte("x"), 375)}); err != nil {
+			t.Fatalf("Auth(%s): %v", tc.mech, err)
+		}
+		c.Close()
+		if got := wrote.String(); got != tc.client {
+			t.Errorf("Auth(%s): wrote %q; want %q", tc.mech, got, tc.client)
+		}
+	}
+}
+
+// largeInitialRespAuth returns a large SASL initial response from Start.
+type largeInitialRespAuth struct {
+	mech string
+	resp []byte
+}
+
+func (a largeInitialRespAuth) Start() (proto string, toServer []byte, err error) {
+	return a.mech, a.resp, nil
+}
+
+func (a largeInitialRespAuth) Next(fromServer []byte) (toServer []byte, err error) {
+	return []byte("response"), nil
+}
+
 type faker struct {
 	io.ReadWriter
 }
@@ -150,8 +284,10 @@ Goodbye.`
 	if _, err := w.Write([]byte(msg)); err != nil {
 		t.Fatalf("Data write failed: %s", err)
 	}
-	if err := w.Close(); err != nil {
+	if resp, err := w.CloseWithResponse(); err != nil {
 		t.Fatalf("Bad data response: %s", err)
+	} else if want := "Data OK"; resp.StatusText != want {
+		t.Errorf("Bad data status text: got %q, want %q", resp.StatusText, want)
 	}
 
 	if err := c.Quit(); err != nil {
@@ -567,6 +703,131 @@ SendMail is working for me.
 QUIT
 `
 
+func TestSendMail_SMTPUTF8_Autodetect(t *testing.T) {
+	buildServer := func(nRcpt int) string {
+		s := "220 hello world\r\n" +
+			"250-mx.example.com at your service\r\n" +
+			"250 SMTPUTF8\r\n" +
+			"250 Sender ok\r\n"
+		for i := 0; i < nRcpt; i++ {
+			s += "250 Receiver ok\r\n"
+		}
+		s += "354 Go ahead\r\n" +
+			"250 Data ok\r\n" +
+			"221 Goodbye\r\n"
+		return s
+	}
+
+	cases := []struct {
+		name     string
+		from     string
+		to       []string
+		wantMail string
+	}{
+		{
+			name:     "ascii both",
+			from:     "arnt@example.com",
+			to:       []string{"info@example.com"},
+			wantMail: "MAIL FROM:<arnt@example.com>",
+		},
+		{
+			name:     "utf8 from",
+			from:     "arnt@grå.org",
+			to:       []string{"info@example.com"},
+			wantMail: "MAIL FROM:<arnt@grå.org> SMTPUTF8",
+		},
+		{
+			name:     "utf8 rcpt only",
+			from:     "arnt@example.com",
+			to:       []string{"info@example.com", "gøril@example.com"},
+			wantMail: "MAIL FROM:<arnt@example.com> SMTPUTF8",
+		},
+		{
+			name:     "utf8 both halves",
+			from:     "grå@grå.org",
+			to:       []string{"阿Q@例子.中国"},
+			wantMail: "MAIL FROM:<grå@grå.org> SMTPUTF8",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var cmdbuf bytes.Buffer
+			bcmdbuf := bufio.NewWriter(&cmdbuf)
+			var fake faker
+			fake.ReadWriter = bufio.NewReadWriter(
+				bufio.NewReader(strings.NewReader(buildServer(len(tc.to)))),
+				bcmdbuf,
+			)
+			c := NewClient(fake)
+			c.localName = "localhost"
+
+			if err := c.SendMail(tc.from, tc.to, strings.NewReader("Subject: t\r\n\r\nhi\r\n")); err != nil {
+				t.Fatalf("SendMail: %v", err)
+			}
+			bcmdbuf.Flush()
+			got := cmdbuf.String()
+			if !strings.Contains(got, tc.wantMail+"\r\n") {
+				t.Errorf("missing %q in:\n%s", tc.wantMail, got)
+			}
+			// Negative check: ASCII case must not emit SMTPUTF8.
+			if tc.wantMail == "MAIL FROM:<"+tc.from+">" && strings.Contains(got, "SMTPUTF8") {
+				t.Errorf("unexpected SMTPUTF8 in ASCII-only case:\n%s", got)
+			}
+		})
+	}
+}
+
+func TestSendMail_SMTPUTF8_NotAdvertised(t *testing.T) {
+	const server = "220 hello world\r\n" +
+		"250-mx.example.com at your service\r\n" +
+		"250 PIPELINING\r\n" +
+		"221 Goodbye\r\n"
+
+	var cmdbuf bytes.Buffer
+	bcmdbuf := bufio.NewWriter(&cmdbuf)
+	var fake faker
+	fake.ReadWriter = bufio.NewReadWriter(
+		bufio.NewReader(strings.NewReader(server)),
+		bcmdbuf,
+	)
+	c := NewClient(fake)
+	c.localName = "localhost"
+
+	err := c.SendMail("arnt@example.com", []string{"gøril@example.com"},
+		strings.NewReader("Subject: t\r\n\r\nhi\r\n"))
+	if err == nil {
+		t.Fatal("SendMail: expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "SMTPUTF8") {
+		t.Errorf("error %q does not mention SMTPUTF8", err)
+	}
+	bcmdbuf.Flush()
+	got := cmdbuf.String()
+	for _, forbidden := range []string{"MAIL ", "RCPT ", "DATA"} {
+		if strings.Contains(got, forbidden) {
+			t.Errorf("client sent %q despite missing SMTPUTF8:\n%s", forbidden, got)
+		}
+	}
+}
+
+func TestIsASCII(t *testing.T) {
+	cases := []struct {
+		s    string
+		want bool
+	}{
+		{"", true},
+		{"arnt@example.com", true},
+		{"grå@example.com", false},
+		{"arnt@grå.org", false},
+	}
+	for _, tc := range cases {
+		if got := isASCII(tc.s); got != tc.want {
+			t.Errorf("isASCII(%q) = %v, want %v", tc.s, got, tc.want)
+		}
+	}
+}
+
 func TestAuthFailed(t *testing.T) {
 	server := strings.Join(strings.Split(authFailedServer, "\n"), "\r\n")
 	client := strings.Join(strings.Split(authFailedClient, "\n"), "\r\n")
@@ -916,36 +1177,96 @@ Line 1
 .Leading dot line .
 Goodbye.`
 
-	rcpts := []string{}
-	errors := []*SMTPError{}
-
-	w, err := c.LMTPData(func(rcpt string, status *SMTPError) {
-		rcpts = append(rcpts, rcpt)
-		errors = append(errors, status)
-	})
+	w, err := c.Data()
 	if err != nil {
 		t.Fatalf("DATA failed: %s", err)
 	}
 	if _, err := w.Write([]byte(msg)); err != nil {
 		t.Fatalf("Data write failed: %s", err)
 	}
-	if err := w.Close(); err != nil {
-		t.Fatalf("Bad data response: %s", err)
+	resp, err := w.CloseWithLMTPResponse()
+
+	var lmtpErr LMTPDataError
+	if !errors.As(err, &lmtpErr) {
+		t.Fatalf("Want error of type LMTPDataError")
 	}
 
-	if !reflect.DeepEqual(rcpts, []string{"golang-nuts@googlegroups.com", "golang-not-nuts@googlegroups.com"}) {
-		t.Fatal("Status callbacks called for wrong recipients:", rcpts)
+	wantResp := map[string]*DataResponse{
+		"golang-nuts@googlegroups.com": {StatusText: "This recipient is fine"},
 	}
 
-	if len(errors) != 2 {
-		t.Fatalf("Wrong amount of status callback calls: %v", len(errors))
+	if !reflect.DeepEqual(resp, wantResp) {
+		t.Fatalf("resp = %v, want %v", resp, wantResp)
 	}
-	if errors[0] != nil {
-		t.Fatalf("Unexpected error status for the first recipient: %v", errors[0])
+
+	if len(lmtpErr) != 1 {
+		t.Fatalf("len(lmtpErr) = %v, want 1", len(lmtpErr))
 	}
-	if errors[1] == nil {
-		t.Fatalf("Unexpected success status for the second recipient")
+	if lmtpErr["golang-not-nuts@googlegroups.com"] == nil {
+		t.Fatalf("Want error for second recipient")
 	}
+
+	if err := c.Quit(); err != nil {
+		t.Fatalf("QUIT failed: %s", err)
+	}
+}
+
+func TestLMTPDataTwoMessages(t *testing.T) {
+	var lmtpServerTwoMessages = `220 localhost Simple Mail Transfer Service Ready
+250-localhost at your service
+250 8BITMIME
+250 Sender OK
+250 Receiver OK
+354 Go ahead
+250 First message OK
+250 Sender OK
+250 Receiver OK
+354 Go ahead
+250 Second message OK
+221 OK
+`
+	server := strings.Join(strings.Split(lmtpServerTwoMessages, "\n"), "\r\n")
+
+	var cmdbuf bytes.Buffer
+	bcmdbuf := bufio.NewWriter(&cmdbuf)
+	var fake faker
+	fake.ReadWriter = bufio.NewReadWriter(bufio.NewReader(strings.NewReader(server)), bcmdbuf)
+	c := &Client{text: textproto.NewConn(fake), conn: fake, lmtp: true}
+
+	if err := c.Hello("localhost"); err != nil {
+		t.Fatalf("LHLO failed: %s", err)
+	}
+	c.didHello = true
+
+	send := func(rcpt, statusText string) {
+		t.Helper()
+
+		if err := c.Mail("user@gmail.com", nil); err != nil {
+			t.Fatalf("MAIL failed: %s", err)
+		}
+		if err := c.Rcpt(rcpt, nil); err != nil {
+			t.Fatalf("RCPT failed: %s", err)
+		}
+		w, err := c.Data()
+		if err != nil {
+			t.Fatalf("DATA failed: %s", err)
+		}
+		if _, err := w.Write([]byte("Hello")); err != nil {
+			t.Fatalf("Data write failed: %s", err)
+		}
+		resp, err := w.CloseWithLMTPResponse()
+		if err != nil {
+			t.Fatalf("CloseWithLMTPResponse failed: %s", err)
+		}
+
+		wantResp := map[string]*DataResponse{rcpt: {StatusText: statusText}}
+		if !reflect.DeepEqual(resp, wantResp) {
+			t.Fatalf("resp = %v, want %v", resp, wantResp)
+		}
+	}
+
+	send("golang-nuts@googlegroups.com", "First message OK")
+	send("golang-not-nuts@googlegroups.com", "Second message OK")
 
 	if err := c.Quit(); err != nil {
 		t.Fatalf("QUIT failed: %s", err)
@@ -1038,6 +1359,110 @@ func TestClientDSN(t *testing.T) {
 	c.Rcpt(dsnEmailUTF8, &RcptOptions{
 		OriginalRecipientType: DSNAddressTypeUTF8,
 		OriginalRecipient:     dsnEmailUTF8,
+	})
+	c.Close()
+	if actualcmds := wrote.String(); client != actualcmds {
+		t.Errorf("wrote %q; want %q", actualcmds, client)
+	}
+}
+
+var rrvsServer = `220 hello world
+250 ok
+250 ok
+`
+
+var rrvsClient = `RCPT TO:<root@nsa.gov> RRVS=2014-04-03T23:01:00Z
+RCPT TO:<root@gchq.gov.uk>
+`
+
+func TestClientRRVS(t *testing.T) {
+	server := strings.Join(strings.Split(rrvsServer, "\n"), "\r\n")
+	client := strings.Join(strings.Split(rrvsClient, "\n"), "\r\n")
+
+	var wrote bytes.Buffer
+	var fake faker
+	fake.ReadWriter = struct {
+		io.Reader
+		io.Writer
+	}{
+		strings.NewReader(server),
+		&wrote,
+	}
+	c := NewClient(fake)
+	c.didHello = true
+	c.ext = map[string]string{"RRVS": ""}
+	c.Rcpt("root@nsa.gov", &RcptOptions{
+		RequireRecipientValidSince: time.Date(2014, time.April, 3, 23, 1, 0, 0, time.UTC),
+	})
+	c.Rcpt("root@gchq.gov.uk", &RcptOptions{})
+	c.Close()
+	if actualcmds := wrote.String(); client != actualcmds {
+		t.Errorf("wrote %q; want %q", actualcmds, client)
+	}
+}
+
+var deliverByServer = `220 hello world
+250 ok
+`
+
+var deliverByClient = `MAIL FROM:<root@nsa.gov> BY=100;RT
+`
+
+func TestClientDELIVERBY(t *testing.T) {
+	server := strings.Join(strings.Split(deliverByServer, "\n"), "\r\n")
+	client := strings.Join(strings.Split(deliverByClient, "\n"), "\r\n")
+
+	var wrote bytes.Buffer
+	var fake faker
+	fake.ReadWriter = struct {
+		io.Reader
+		io.Writer
+	}{
+		strings.NewReader(server),
+		&wrote,
+	}
+	c := NewClient(fake)
+	c.didHello = true
+	c.ext = map[string]string{"DELIVERBY": ""}
+	c.Mail("root@nsa.gov", &MailOptions{
+		DeliverBy: &DeliverByOptions{
+			Time:  100 * time.Second,
+			Mode:  DeliverByReturn,
+			Trace: true,
+		},
+	})
+	c.Close()
+	if actualcmds := wrote.String(); client != actualcmds {
+		t.Errorf("wrote %q; want %q", actualcmds, client)
+	}
+}
+
+var mtPriorityServer = `220 hello world
+250 ok
+`
+
+var mtPriorityClient = `MAIL FROM:<root@nsa.gov> MT-PRIORITY=6
+`
+
+func TestClientMTPRIORITY(t *testing.T) {
+	server := strings.Join(strings.Split(mtPriorityServer, "\n"), "\r\n")
+	client := strings.Join(strings.Split(mtPriorityClient, "\n"), "\r\n")
+
+	var wrote bytes.Buffer
+	var fake faker
+	fake.ReadWriter = struct {
+		io.Reader
+		io.Writer
+	}{
+		strings.NewReader(server),
+		&wrote,
+	}
+	c := NewClient(fake)
+	c.didHello = true
+	c.ext = map[string]string{"MT-PRIORITY": ""}
+	priority := 6
+	c.Mail("root@nsa.gov", &MailOptions{
+		MTPriority: &priority,
 	})
 	c.Close()
 	if actualcmds := wrote.String(); client != actualcmds {

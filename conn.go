@@ -291,6 +291,23 @@ func (c *Conn) handleGreet(enhanced bool, arg string) {
 	if c.server.MaxRecipients > 0 {
 		caps = append(caps, fmt.Sprintf("LIMITS RCPTMAX=%v", c.server.MaxRecipients))
 	}
+	if c.server.EnableRRVS {
+		caps = append(caps, "RRVS")
+	}
+	if c.server.EnableDELIVERBY {
+		if c.server.MinimumDeliverByTime == 0 {
+			caps = append(caps, "DELIVERBY")
+		} else {
+			caps = append(caps, fmt.Sprintf("DELIVERBY %d", int(c.server.MinimumDeliverByTime.Seconds())))
+		}
+	}
+	if c.server.EnableMTPRIORITY {
+		if c.server.MtPriorityProfile == PriorityUnspecified {
+			caps = append(caps, "MT-PRIORITY")
+		} else {
+			caps = append(caps, fmt.Sprintf("MT-PRIORITY %s", c.server.MtPriorityProfile))
+		}
+	}
 
 	args := []string{"Hello " + domain}
 	args = append(args, caps...)
@@ -416,6 +433,38 @@ func (c *Conn) handleMail(arg string) {
 				}
 			}
 			opts.Auth = &value
+		case "BY":
+			if !c.server.EnableDELIVERBY {
+				c.writeResponse(504, EnhancedCode{5, 5, 4}, "DELIVERBY is not implemented")
+				return
+			}
+			deliverBy := parseDeliverByArgument(value)
+			if deliverBy == nil {
+				c.writeResponse(501, EnhancedCode{5, 5, 4}, "Malformed BY parameter value")
+				return
+			}
+			if c.server.MinimumDeliverByTime != 0 &&
+				deliverBy.Mode == DeliverByReturn &&
+				deliverBy.Time < c.server.MinimumDeliverByTime {
+				c.writeResponse(501, EnhancedCode{5, 5, 4}, "BY parameter is below server minimum")
+				return
+			}
+			opts.DeliverBy = deliverBy
+		case "MT-PRIORITY":
+			if !c.server.EnableMTPRIORITY {
+				c.writeResponse(504, EnhancedCode{5, 5, 4}, "MT-PRIORITY is not implemented")
+				return
+			}
+			mtPriority, err := strconv.Atoi(value)
+			if err != nil {
+				c.writeResponse(501, EnhancedCode{5, 5, 4}, "Malformed MT-PRIORITY parameter value")
+				return
+			}
+			if mtPriority < -9 || mtPriority > 9 {
+				c.writeResponse(501, EnhancedCode{5, 5, 4}, "MT-PRIORITY is outside valid range")
+				return
+			}
+			opts.MTPriority = &mtPriority
 		default:
 			c.writeResponse(500, EnhancedCode{5, 5, 4}, "Unknown MAIL FROM argument")
 			return
@@ -669,7 +718,7 @@ func (c *Conn) handleRcpt(arg string) {
 	}
 
 	p := parser{s: strings.TrimSpace(arg)}
-	recipient, err := p.parsePath()
+	recipient, err := p.parseForwardPath()
 	if err != nil {
 		c.writeResponse(501, EnhancedCode{5, 5, 2}, "Was expecting RCPT arg syntax of TO:<address>")
 		return
@@ -716,6 +765,18 @@ func (c *Conn) handleRcpt(arg string) {
 			}
 			opts.OriginalRecipientType = aType
 			opts.OriginalRecipient = aAddr
+		case "RRVS":
+			if !c.server.EnableRRVS {
+				c.writeResponse(504, EnhancedCode{5, 5, 4}, "RRVS is not implemented")
+				return
+			}
+			value, _, _ = strings.Cut(value, ";") // discard the no-support action
+			rrvsTime, err := time.Parse(time.RFC3339, value)
+			if err != nil {
+				c.writeResponse(501, EnhancedCode{5, 5, 4}, "Malformed RRVS parameter value")
+				return
+			}
+			opts.RequireRecipientValidSince = rrvsTime
 		default:
 			c.writeResponse(500, EnhancedCode{5, 5, 4}, "Unknown RCPT TO argument")
 			return
@@ -940,11 +1001,6 @@ func (c *Conn) handleBdat(arg string) {
 		return
 	}
 
-	if !c.fromReceived || len(c.recipients) == 0 {
-		c.writeResponse(502, EnhancedCode{5, 5, 1}, "Missing RCPT TO command.")
-		return
-	}
-
 	last := false
 	if len(args) == 2 {
 		if !strings.EqualFold(args[1], "LAST") {
@@ -958,6 +1014,13 @@ func (c *Conn) handleBdat(arg string) {
 	size, err := strconv.ParseUint(args[0], 10, 32)
 	if err != nil {
 		c.writeResponse(501, EnhancedCode{5, 5, 4}, "Malformed size argument")
+		return
+	}
+
+	if !c.fromReceived || len(c.recipients) == 0 {
+		c.writeResponse(502, EnhancedCode{5, 5, 1}, "Missing RCPT TO command.")
+		// The chunk follows the command even when the command is rejected.
+		io.Copy(ioutil.Discard, io.LimitReader(c.text.R, int64(size)))
 		return
 	}
 
@@ -1012,6 +1075,9 @@ func (c *Conn) handleBdat(arg string) {
 	}
 
 	c.lineLimitReader.LineLimit = 0
+	defer func() {
+		c.lineLimitReader.LineLimit = c.server.MaxLineLength
+	}()
 
 	chunk := io.LimitReader(c.text.R, int64(size))
 	_, err = io.Copy(c.bdatPipe, chunk)
@@ -1027,15 +1093,12 @@ func (c *Conn) handleBdat(arg string) {
 		}
 
 		c.reset()
-		c.lineLimitReader.LineLimit = c.server.MaxLineLength
 		return
 	}
 
 	c.bytesReceived += int64(size)
 
 	if last {
-		c.lineLimitReader.LineLimit = c.server.MaxLineLength
-
 		c.bdatPipe.Close()
 
 		err := <-c.dataResult
@@ -1154,6 +1217,7 @@ func (c *Conn) handleDataLMTP() {
 	if !ok {
 		// Fallback to using a single status for all recipients.
 		err := c.Session().Data(r)
+		r.limited = false
 		io.Copy(ioutil.Discard, r) // Make sure all the data has been consumed
 		for _, rcpt := range c.recipients {
 			status.SetStatus(rcpt, err)
@@ -1176,6 +1240,7 @@ func (c *Conn) handleDataLMTP() {
 			}()
 
 			status.fillRemaining(lmtpSession.LMTPData(r, status))
+			r.limited = false
 			io.Copy(ioutil.Discard, r) // Make sure all the data has been consumed
 			done <- true
 		}()
@@ -1186,7 +1251,7 @@ func (c *Conn) handleDataLMTP() {
 		c.writeResponse(code, enchCode, "<"+rcpt+"> "+msg)
 	}
 
-	// If done gets false, the panic occured in LMTPData and the connection
+	// If done gets false, the panic occurred in LMTPData and the connection
 	// should be closed.
 	if !<-done {
 		c.Close()
@@ -1236,13 +1301,17 @@ func (c *Conn) writeResponse(code int, enhCode EnhancedCode, text ...string) {
 		}
 	}
 
-	for i := 0; i < len(text)-1; i++ {
+	// transform each single line with \n, into separate lines
+	text = strings.Split(strings.Join(text, "\n"), "\n")
+
+	lastLineIndex := len(text) - 1
+	for i := 0; i < lastLineIndex; i++ {
 		c.text.PrintfLine("%d-%v", code, text[i])
 	}
 	if enhCode == NoEnhancedCode {
-		c.text.PrintfLine("%d %v", code, text[len(text)-1])
+		c.text.PrintfLine("%d %v", code, text[lastLineIndex])
 	} else {
-		c.text.PrintfLine("%d %v.%v.%v %v", code, enhCode[0], enhCode[1], enhCode[2], text[len(text)-1])
+		c.text.PrintfLine("%d %v.%v.%v %v", code, enhCode[0], enhCode[1], enhCode[2], text[lastLineIndex])
 	}
 }
 

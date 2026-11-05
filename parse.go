@@ -2,7 +2,9 @@ package smtp
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // cutPrefixFold is a version of strings.CutPrefix which is case-insensitive.
@@ -74,6 +76,34 @@ func parseHelloArgument(arg string) (string, error) {
 	return domain, nil
 }
 
+// Parses the BY argument defined in RFC2852 section 4.
+// Returns pointer to options or nil if invalid.
+func parseDeliverByArgument(arg string) *DeliverByOptions {
+	secondsStr, modeStr, ok := strings.Cut(arg, ";")
+	if !ok {
+		return nil
+	}
+	modeStr, traceValue := strings.CutSuffix(modeStr, "T")
+	if modeStr != string(DeliverByNotify) && modeStr != string(DeliverByReturn) {
+		return nil
+	}
+	modeValue := DeliverByMode(modeStr)
+	secondsValue, err := strconv.Atoi(secondsStr)
+	// Specified in rfc2852
+	// by-time      = ["-" / "+"]1*9digit ; a negative or zero value is not
+	//				      ; allowed with a by-mode of "R"
+	if err != nil ||
+		(modeValue == DeliverByReturn && (secondsValue < 1 || secondsValue > 999999999)) ||
+		(modeValue == DeliverByNotify && (secondsValue < -999999999 || secondsValue > 999999999)) {
+		return nil
+	}
+	return &DeliverByOptions{
+		Time:  time.Duration(secondsValue) * time.Second,
+		Mode:  modeValue,
+		Trace: traceValue,
+	}
+}
+
 // parser parses command arguments defined in RFC 5321 section 4.1.2.
 type parser struct {
 	s string
@@ -118,6 +148,19 @@ func (p *parser) parseReversePath() (string, error) {
 	if strings.HasPrefix(p.s, "<>") {
 		p.s = strings.TrimPrefix(p.s, "<>")
 		return "", nil
+	}
+	return p.parsePath()
+}
+
+// parseForwardPath parses the argument of RCPT TO. Unlike a reverse-path, it
+// may be "<Postmaster>" without a domain (RFC 5321 section 4.1.1.3), which is
+// returned as given.
+func (p *parser) parseForwardPath() (string, error) {
+	const postmaster = "<postmaster>"
+	if len(p.s) >= len(postmaster) && strings.EqualFold(p.s[:len(postmaster)], postmaster) {
+		path := p.s[1 : len(postmaster)-1]
+		p.s = p.s[len(postmaster):]
+		return path, nil
 	}
 	return p.parsePath()
 }
